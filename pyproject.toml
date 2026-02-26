@@ -1,0 +1,29 @@
+[project]
+name = "nous-memory"
+version = "0.1.0"
+description = "Persistent memory system for AI agents — capture, recall, and evolve knowledge across sessions"
+readme = {text = "Persistent memory system for AI agents. Full documentation at https://github.com/nous-labs/nous-memory", content-type = "text/plain"}
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [{name = "nous-labs"}]
+keywords = ["ai", "memory", "agents", "opencode", "mcp", "persistent-memory"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.scripts]
+nous-memory = "nous_memory.cli:main"
+nous-memory-mcp = "nous_memory.mcp_server:main"
+
+[project.optional-dependencies]
+mcp = ["mcp[cli]>=1.26.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nous_memory"]
