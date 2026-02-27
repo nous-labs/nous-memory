@@ -6,7 +6,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from .core import EXIT_OK, color, connect_db, ensure_schema, fail, log_verbose, resolve_db_path, cmd_curate
+from .core import EXIT_OK, color, connect_db, ensure_schema, fail, log_verbose, resolve_db_path, cmd_curate, cmd_verify
 from .memory import cmd_capture, cmd_recall, cmd_search, cmd_get, cmd_timeline, cmd_update, cmd_forget
 from .tasks import cmd_tasks, cmd_remind
 from .entities import cmd_entities
@@ -44,6 +44,7 @@ def build_parser():
     capture.add_argument("--topic-key", help="stable topic identifier for in-place updates")
     capture.add_argument("--headline", help="explicit headline (default: first sentence)")
     capture.add_argument("--no-synthesis", action="store_true", help="skip duplicate/similarity detection")
+    capture.add_argument("--metadata", help="JSON metadata string (e.g. '{\"auto_extracted\": true}')")
     capture.add_argument("content", nargs="?")
     capture.add_argument("--content", dest="content_flag", help="memory content text")
 
@@ -84,6 +85,8 @@ def build_parser():
     forget.add_argument("id", type=int)
     forget.add_argument("--hard", action="store_true", help="hard delete")
 
+    verify = subparsers.add_parser("verify", help="verify an auto-extracted memory (set verified_at)")
+    verify.add_argument("id", type=int, help="memory ID to verify")
     tasks = subparsers.add_parser("tasks", help="manage tasks")
     tasks.add_argument("--all", action="store_true", help="list all tasks")
     tasks.add_argument("--due", action="store_true", help="list overdue and due within 24h")
@@ -309,6 +312,8 @@ def run(args):
             return cmd_update(args, conn)
         if args.command == "forget":
             return cmd_forget(args, conn)
+        if args.command == "verify":
+            return cmd_verify(args, conn)
         if args.command == "tasks":
             return cmd_tasks(args, conn)
         if args.command == "remind":

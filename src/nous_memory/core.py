@@ -691,6 +691,16 @@ def cmd_capture(args, conn):
             return fail(f"could not parse expires value '{args.expires}'")
         expires_at = parsed
     no_synthesis = getattr(args, 'no_synthesis', False)
+    metadata_json = None
+    raw_metadata = getattr(args, 'metadata', None)
+    if raw_metadata:
+        try:
+            parsed_meta = json.loads(raw_metadata) if isinstance(raw_metadata, str) else raw_metadata
+            if not isinstance(parsed_meta, dict):
+                return fail('--metadata must be a JSON object')
+            metadata_json = json.dumps(parsed_meta)
+        except json.JSONDecodeError as e:
+            return fail(f'invalid --metadata JSON: {e}')
     memory_id = None
     synthesis_action = None  # None | 'duplicate' | 'related'
     synthesis_match_id = None
@@ -719,19 +729,20 @@ def cmd_capture(args, conn):
                     tags = ?,
                     source = ?,
                     expires_at = ?,
+                    metadata = COALESCE(?, metadata),
                     revision_count = COALESCE(revision_count, 1) + 1,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (args.type, args.content, headline, tags, args.source, expires_at, memory_id),
+                (args.type, args.content, headline, tags, args.source, expires_at, metadata_json, memory_id),
             )
         else:
             cur = conn.execute(
                 """
-                INSERT INTO memories(type, scope, content, headline, tags, source, expires_at, topic_key)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO memories(type, scope, content, headline, tags, source, expires_at, topic_key, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (args.type, args.scope, args.content, headline, tags, args.source, expires_at, args.topic_key),
+                (args.type, args.scope, args.content, headline, tags, args.source, expires_at, args.topic_key, metadata_json),
             )
             memory_id = cur.lastrowid
     else:
@@ -764,10 +775,10 @@ def cmd_capture(args, conn):
         if memory_id is None:
             cur = conn.execute(
                 """
-                INSERT INTO memories(type, scope, content, headline, tags, source, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO memories(type, scope, content, headline, tags, source, expires_at, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (args.type, args.scope, args.content, headline, tags, args.source, expires_at),
+                (args.type, args.scope, args.content, headline, tags, args.source, expires_at, metadata_json),
             )
             memory_id = cur.lastrowid
     conn.commit()
@@ -1378,6 +1389,35 @@ def cmd_forget(args, conn):
         print(color(f"Soft-deleted memory [{args.id}]", "33"))
     return EXIT_OK
 
+
+def cmd_verify(args, conn):
+    """Verify an auto-extracted memory — sets verified_at, removes expires_at."""
+    row = conn.execute("SELECT * FROM memories WHERE id = ? AND deleted_at IS NULL", (args.id,)).fetchone()
+    if row is None:
+        return fail(f"memory {args.id} not found", code=EXIT_NOT_FOUND)
+    if row['verified_at']:
+        if args.json:
+            print(json.dumps({"id": args.id, "already_verified": True, "verified_at": row['verified_at']}, indent=2))
+        else:
+            print(color(f"Memory [{args.id}] already verified at {row['verified_at']}", "33"))
+        return EXIT_OK
+    conn.execute(
+        """
+        UPDATE memories
+        SET verified_at = CURRENT_TIMESTAMP,
+            expires_at = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (args.id,),
+    )
+    conn.commit()
+    updated = conn.execute("SELECT * FROM memories WHERE id = ?", (args.id,)).fetchone()
+    if args.json:
+        print(json.dumps(memory_to_json(updated), indent=2))
+    else:
+        print(color(f"Verified memory [{args.id}] — now permanent, included in bootstrap", "32"))
+    return EXIT_OK
 
 def task_to_json(row):
     return row_to_dict(row)
@@ -3054,6 +3094,7 @@ def cmd_bootstrap(args, conn):
           AND superseded_by IS NULL
           AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
           AND (',' || tags || ',' LIKE '%,hard-constraint,%')
+          AND NOT (metadata IS NOT NULL AND json_extract(metadata, '$.auto_extracted') = 1 AND verified_at IS NULL)
         ORDER BY id ASC
         """,
     ).fetchall()
@@ -3079,6 +3120,7 @@ def cmd_bootstrap(args, conn):
           AND superseded_by IS NULL
           AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
           AND (tags IS NULL OR NOT (',' || tags || ',' LIKE '%,hard-constraint,%'))
+          AND NOT (metadata IS NOT NULL AND json_extract(metadata, '$.auto_extracted') = 1 AND verified_at IS NULL)
           {preference_scope_clause}
         ORDER BY created_at DESC, id DESC
         LIMIT 20
@@ -3210,6 +3252,22 @@ def cmd_bootstrap(args, conn):
             marker = "x" if row["type"] == "failure" else "+"
             pattern_lines.append(f"- {marker} [{row['id']}] {content}")
 
+    # --- Unverified auto-extracted count (always shown as hint, no content) ---
+    unverified_scope_clause = 'AND scope = ?' if scope else ''
+    unverified_scope_vals = (scope,) if scope else ()
+    unverified_count = conn.execute(
+        f"""
+        SELECT COUNT(*) AS c FROM memories
+        WHERE deleted_at IS NULL
+          AND superseded_by IS NULL
+          AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
+          AND json_extract(metadata, '$.auto_extracted') = 1
+          AND verified_at IS NULL
+          {unverified_scope_clause}
+        """,
+        unverified_scope_vals,
+    ).fetchone()['c']
+
     sections = [
         ("Constraints", constraint_lines),
         ("Preferences", preference_lines),
@@ -3237,6 +3295,9 @@ def cmd_bootstrap(args, conn):
         result = "No bootstrap context available."
     else:
         result = "\n".join(output_parts).rstrip()
+        if unverified_count > 0:
+            hint = f"\n\u26a0 {unverified_count} unverified auto-extracted memories pending review (run `curate` to see details)"
+            result += hint
 
     if args.json:
         payload = {
@@ -3253,6 +3314,7 @@ def cmd_bootstrap(args, conn):
                 "recent": len(recent_lines),
                 "patterns": len(pattern_lines),
             },
+            "unverified_auto_extracted": unverified_count,
             "output": result,
         }
         print(json.dumps(payload, indent=2))
@@ -3633,6 +3695,40 @@ def cmd_curate(args, conn):
         'pattern_clusters': len(report['recurring_patterns']),
     }
 
+    # --- Unverified auto-extracted memories ---
+    unverified_rows = conn.execute(
+        f"""
+        SELECT id, type, scope, content, metadata, created_at, expires_at
+        FROM memories
+        WHERE deleted_at IS NULL
+          AND superseded_by IS NULL
+          AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
+          AND json_extract(metadata, '$.auto_extracted') = 1
+          AND verified_at IS NULL
+          {scope_clause}
+        ORDER BY created_at DESC
+        LIMIT 30
+        """,
+        scope_vals,
+    ).fetchall()
+    report['unverified_auto_extracted'] = []
+    for r in unverified_rows:
+        meta = {}
+        if r['metadata']:
+            try:
+                meta = json.loads(r['metadata']) if isinstance(r['metadata'], str) else (r['metadata'] or {})
+            except (json.JSONDecodeError, TypeError):
+                meta = {}
+        report['unverified_auto_extracted'].append({
+            'id': r['id'],
+            'type': r['type'],
+            'scope': r['scope'],
+            'confidence': meta.get('confidence', '?'),
+            'snippet': r['content'][:100],
+            'created': r['created_at'],
+            'expires': r['expires_at'],
+        })
+
     detected_relationships = _detect_relationships(conn, scope=scope)
     links_created = 0
     superseded_count = 0
@@ -3717,6 +3813,17 @@ def cmd_curate(args, conn):
     print(f'  Oldest: {humanize_datetime(h["oldest_memory"])}  |  Newest: {humanize_datetime(h["newest_memory"])}')
     print()
 
+    if report['unverified_auto_extracted']:
+        print(color(f'Unverified Auto-Extracted ({len(report["unverified_auto_extracted"])} pending review):', '33'))
+        print(f'  Use `verify <id>` to approve or `forget <id>` to discard.')
+        for item in report['unverified_auto_extracted']:
+            conf = item['confidence']
+            conf_str = f'{conf:.0%}' if isinstance(conf, (int, float)) else str(conf)
+            expires_str = f'  expires={humanize_datetime(item["expires"])}' if item['expires'] else ''
+            print(f'  [{item["id"]}] {item["type"]}  scope={item["scope"]}  confidence={conf_str}{expires_str}')
+            print(f'    {item["snippet"]}')
+        print()
+
     if report['stale_decisions']:
         print(color(f'Stale Decisions ({len(report["stale_decisions"])} older than {stale_days}d):', '33'))
         for item in report['stale_decisions']:
@@ -3750,6 +3857,7 @@ def cmd_curate(args, conn):
         report['expiring'],
         report['contradiction_candidates'],
         report['recurring_patterns'],
+        report['unverified_auto_extracted'],
     ]):
         print(color('All clear - no issues found.', '32'))
         print()

@@ -107,6 +107,7 @@ def memory_capture(
     expires: Optional[str] = None,
     topic_key: Optional[str] = None,
     no_synthesis: bool = False,
+    metadata: Optional[str] = None,
 ) -> dict:
     """Store a memory.
 
@@ -119,12 +120,13 @@ def memory_capture(
         expires: Expiry date — ISO format or relative (tomorrow, in 3 days).
         topic_key: Stable topic identifier for in-place upserts.
         no_synthesis: Skip duplicate/similarity detection if True.
+        metadata: Optional JSON string with additional data (e.g. '{"auto_extracted": true, "confidence": 0.65}').
     """
     return _call(
         memory.cmd_capture,
         type=type, content=content, scope=scope, tags=tags,
         source=source, expires=expires, topic_key=topic_key,
-        no_synthesis=no_synthesis,
+        no_synthesis=no_synthesis, metadata=metadata,
     )
 
 
@@ -217,6 +219,18 @@ def memory_forget(id: int, hard: bool = False) -> dict:
         hard: If True, permanently delete (cannot be recovered).
     """
     return _call(memory.cmd_forget, id=id, hard=hard)
+
+@_tool()
+def memory_verify(id: int) -> dict:
+    """Verify an auto-extracted memory, promoting it to trusted status.
+
+    Sets verified_at timestamp, removes TTL expiry, and includes the memory in bootstrap.
+    Use this after reviewing auto-extracted memories shown by curate.
+
+    Args:
+        id: Memory ID to verify.
+    """
+    return _call(core.cmd_verify, id=id)
 
 
 # ===========================================================================
