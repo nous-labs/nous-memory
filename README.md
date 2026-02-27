@@ -51,16 +51,13 @@ Built for opencode/oh-my-opencode users and AI agent developers who need their a
 ### Installation
 
 ```bash
-# From PyPI (when published)
-pip install nous-memory
-
-# With MCP support
-pip install 'nous-memory[mcp]'
-
 # From source
 git clone https://github.com/nous-labs/nous-memory.git
 cd nous-memory
 pip install -e .
+
+# With MCP support
+pip install -e '.[mcp]'
 ```
 
 ### Basic Usage
@@ -306,6 +303,8 @@ nous-memory recall --semantic "authentication patterns"
 | `timeline` | Show +/-24h context around a memory |
 | `update` | Update memory by superseding |
 | `forget` | Soft or hard delete a memory |
+| `verify` | Verify an auto-extracted memory (set verified_at) |
+| `curate` | Extended dream: detect relationships between memories |
 | `tasks` | List, add, done, cancel tasks |
 | `remind` | Create reminder task with due date |
 | `entities` | Manage entities (projects, tools, etc.) |
