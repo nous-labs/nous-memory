@@ -12,6 +12,7 @@ import subprocess
 import os
 import urllib.request
 import urllib.parse
+import urllib.error
 import tempfile
 import textwrap
 from pathlib import Path
@@ -24,7 +25,7 @@ MEMORY_TYPES = ("decision", "preference", "fact", "observation", "failure", "pat
 TASK_STATUSES = ("pending", "active", "done", "cancelled")
 TASK_PRIORITIES = ("low", "medium", "high", "critical")
 ENTITY_TYPES = ("project", "provider", "tool", "person", "repo")
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 6
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS memories (
@@ -32,8 +33,10 @@ CREATE TABLE IF NOT EXISTS memories (
     type TEXT NOT NULL,
     scope TEXT DEFAULT 'global',
     content TEXT NOT NULL,
+    headline TEXT,
     tags TEXT,
     source TEXT,
+    metadata JSON,
     topic_key TEXT,
     deleted_at DATETIME,
     revision_count INTEGER DEFAULT 1,
@@ -84,6 +87,33 @@ CREATE TABLE IF NOT EXISTS kv (
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS recall_trace (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    command TEXT NOT NULL,
+    scope TEXT,
+    query TEXT,
+    tier INTEGER,
+    budget_chars INTEGER,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS recall_trace_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES recall_trace(id) ON DELETE CASCADE,
+    step TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS memory_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    src_memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    relation TEXT NOT NULL,
+    dst_memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    note TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(type);
 CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope);
 CREATE INDEX IF NOT EXISTS idx_memories_tags ON memories(tags);
@@ -91,6 +121,9 @@ CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(due_date);
 CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type);
 CREATE INDEX IF NOT EXISTS idx_session_refs_session ON session_refs(session_id);
+CREATE INDEX IF NOT EXISTS idx_trace_events_run ON recall_trace_events(run_id, id);
+CREATE INDEX IF NOT EXISTS idx_links_src ON memory_links(src_memory_id, relation);
+CREATE INDEX IF NOT EXISTS idx_links_dst ON memory_links(dst_memory_id, relation);
 
 CREATE TABLE IF NOT EXISTS episodes (
     id TEXT PRIMARY KEY,
@@ -220,6 +253,23 @@ def normalize_tags(tags):
     return ",".join(unique)
 
 
+def extract_headline(content: str, max_len: int = 120) -> str:
+    text = (content or "").strip()
+    if not text:
+        return ""
+    split_at = len(text)
+    markers = (". ", ".\n", "\n")
+    for marker in markers:
+        idx = text.find(marker)
+        if idx != -1:
+            end = idx + (1 if marker.startswith(".") else 0)
+            split_at = min(split_at, end)
+    headline = text[:split_at].strip()
+    if len(headline) > max_len:
+        headline = headline[: max_len - 3].rstrip() + "..."
+    return headline
+
+
 def split_tags(tags):
     if not tags:
         return []
@@ -317,7 +367,7 @@ def ensure_backup_for_migration(db_path):
     return backup_path
 
 
-def ensure_fts(conn):
+def ensure_fts(conn, force_rebuild=False):
     conn.execute(
         """
         CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -362,7 +412,9 @@ def ensure_fts(conn):
             SELECT id, content, tags, type, scope FROM memories
             """
         )
-    conn.execute("INSERT INTO memories_fts(memories_fts) VALUES ('rebuild')")
+        conn.execute("INSERT INTO memories_fts(memories_fts) VALUES ('rebuild')")
+    elif force_rebuild:
+        conn.execute("INSERT INTO memories_fts(memories_fts) VALUES ('rebuild')")
 
 
 def ensure_schema(conn, db_path):
@@ -372,9 +424,14 @@ def ensure_schema(conn, db_path):
     schema_version = 0
     if version_row is not None:
         try:
-            schema_version = int(decode_json_value(version_row["value"]))
+            decoded_version = decode_json_value(version_row["value"])
+            if isinstance(decoded_version, (int, float, str, bool)):
+                schema_version = int(decoded_version)
+            else:
+                schema_version = 0
         except (ValueError, TypeError, json.JSONDecodeError):
             schema_version = 0
+    schema_changed = schema_version < SCHEMA_VERSION
 
     if schema_version < 1:
         needs_backup = (
@@ -396,8 +453,6 @@ def ensure_schema(conn, db_path):
         conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_topic_key ON memories(topic_key)")
         conn.execute("UPDATE memories SET revision_count = 1 WHERE revision_count IS NULL")
         conn.execute("UPDATE memories SET duplicate_count = 0 WHERE duplicate_count IS NULL")
-
-        ensure_fts(conn)
 
         conn.execute(
             """
@@ -449,8 +504,57 @@ def ensure_schema(conn, db_path):
             (json.dumps(SCHEMA_VERSION),),
         )
 
-    if schema_version >= 1:
-        ensure_fts(conn)
+    if schema_version < 4:
+        if not has_column(conn, 'memories', 'headline'):
+            conn.execute('ALTER TABLE memories ADD COLUMN headline TEXT')
+        conn.execute(
+            """
+            UPDATE memories
+            SET headline = substr(
+                content,
+                1,
+                CASE
+                    WHEN instr(content, '.') > 0 AND instr(content, '.') <= 120 THEN instr(content, '.')
+                    ELSE MIN(length(content), 120)
+                END
+            )
+            WHERE headline IS NULL
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO kv(key, value, updated_at)
+            VALUES ('schema_version', ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+            """,
+            (json.dumps(SCHEMA_VERSION),),
+        )
+
+    if schema_version < 5:
+        if not has_column(conn, 'memories', 'metadata'):
+            conn.execute('ALTER TABLE memories ADD COLUMN metadata JSON')
+        conn.execute(
+            """
+            INSERT INTO kv(key, value, updated_at)
+            VALUES ('schema_version', ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+            """,
+            (json.dumps(5),),
+        )
+
+    if schema_version < 6:
+        # memory_links table is created by SCHEMA_SQL executescript above
+        # Just bump version
+        conn.execute(
+            """
+            INSERT INTO kv(key, value, updated_at)
+            VALUES ('schema_version', ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+            """,
+            (json.dumps(6),),
+        )
+
+    ensure_fts(conn, force_rebuild=schema_changed)
 
     conn.commit()
 
@@ -502,6 +606,7 @@ def parse_relative_date(text):
 def memory_to_json(row):
     data = row_to_dict(row)
     data["tags"] = split_tags(data.get("tags"))
+    data["headline"] = data.get("headline")
     return data
 
 
@@ -518,8 +623,8 @@ def build_memory_filters(args, table_alias=""):
         values.append(args.scope)
     if getattr(args, "tags", None):
         for tag in split_tags(args.tags):
-            clauses.append(f"{prefix}tags LIKE ?")
-            values.append(f"%{tag}%")
+            clauses.append(f"(',' || {prefix}tags || ',' LIKE ?)")
+            values.append(f"%,{tag.strip()},%")
     if getattr(args, "active", False):
         clauses.append(f"{prefix}superseded_by IS NULL")
         clauses.append(f"({prefix}expires_at IS NULL OR {prefix}expires_at > CURRENT_TIMESTAMP)")
@@ -578,6 +683,7 @@ def find_similar_memories(conn, content, mem_type, scope, exclude_id=None, limit
 
 def cmd_capture(args, conn):
     tags = normalize_tags(args.tags)
+    headline = args.headline or extract_headline(args.content)
     expires_at = None
     if args.expires:
         parsed = parse_relative_date(args.expires)
@@ -609,6 +715,7 @@ def cmd_capture(args, conn):
                 UPDATE memories
                 SET type = ?,
                     content = ?,
+                    headline = ?,
                     tags = ?,
                     source = ?,
                     expires_at = ?,
@@ -616,15 +723,15 @@ def cmd_capture(args, conn):
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (args.type, args.content, tags, args.source, expires_at, memory_id),
+                (args.type, args.content, headline, tags, args.source, expires_at, memory_id),
             )
         else:
             cur = conn.execute(
                 """
-                INSERT INTO memories(type, scope, content, tags, source, expires_at, topic_key)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO memories(type, scope, content, headline, tags, source, expires_at, topic_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (args.type, args.scope, args.content, tags, args.source, expires_at, args.topic_key),
+                (args.type, args.scope, args.content, headline, tags, args.source, expires_at, args.topic_key),
             )
             memory_id = cur.lastrowid
     else:
@@ -657,10 +764,10 @@ def cmd_capture(args, conn):
         if memory_id is None:
             cur = conn.execute(
                 """
-                INSERT INTO memories(type, scope, content, tags, source, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO memories(type, scope, content, headline, tags, source, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (args.type, args.scope, args.content, tags, args.source, expires_at),
+                (args.type, args.scope, args.content, headline, tags, args.source, expires_at),
             )
             memory_id = cur.lastrowid
     conn.commit()
@@ -779,10 +886,131 @@ def _rerank_with_scores(conn, rows, now):
     return scored
 
 
+def _activation_signal_count(row, args, now):
+    signals = 0
+    query_tags = split_tags(getattr(args, 'tags', None) or '')
+    query_scope = getattr(args, 'scope', None)
+    has_query = bool(getattr(args, 'query', None))
+
+    if has_query:
+        signals += 1
+
+    row_tags = split_tags(row['tags'] if 'tags' in row.keys() else None)
+    query_tag_set = {t.lower() for t in query_tags}
+    row_tag_set = {t.lower() for t in row_tags}
+    if query_tag_set and (query_tag_set & row_tag_set):
+        signals += 1
+
+    if query_scope and row['scope'] == query_scope:
+        signals += 1
+
+    created = parse_dt(row['created_at'])
+    if created:
+        age_days = (now - created).total_seconds() / 86400
+        if age_days <= 7:
+            signals += 1
+
+    return signals
+
+
+def _rerank_with_activation(conn, rows, args, now, threshold=2):
+    if not rows:
+        return []
+
+    ids = [row['id'] for row in rows]
+    placeholders = ','.join('?' for _ in ids)
+    stats_rows = conn.execute(
+        f'SELECT memory_id, access_score FROM memory_access_stats WHERE memory_id IN ({placeholders})',
+        ids,
+    ).fetchall()
+    stats_map = {r['memory_id']: float(r['access_score'] or 0.0) for r in stats_rows}
+
+    query_tags = split_tags(getattr(args, 'tags', None) or '')
+    query_scope = getattr(args, 'scope', None)
+    has_query = bool(getattr(args, 'query', None))
+    query_tag_set = {t.lower() for t in query_tags}
+
+    scored = []
+    for i, row in enumerate(rows):
+        signals = 0
+        signal_weights = 0.0
+
+        if has_query:
+            signals += 1
+            base_relevance = 1.0 / (1 + i)
+            signal_weights += 0.3 * base_relevance
+
+        row_tags = split_tags(row['tags'] if 'tags' in row.keys() else None)
+        row_tag_set = {t.lower() for t in row_tags}
+        tag_overlap = len(query_tag_set & row_tag_set)
+        if tag_overlap > 0:
+            signals += 1
+            signal_weights += 0.25 * min(1.0, tag_overlap / max(len(query_tag_set), 1))
+
+        if query_scope and row['scope'] == query_scope:
+            signals += 1
+            signal_weights += 0.25
+
+        created = parse_dt(row['created_at'])
+        if created:
+            age_days = (now - created).total_seconds() / 86400
+            if age_days <= 7:
+                signals += 1
+                signal_weights += 0.2 * (1.0 - age_days / 7)
+
+        access_score = stats_map.get(row['id'], 0.0)
+        freq_boost = 1.0 + 0.2 * math.log1p(access_score)
+
+        metadata = {}
+        if 'metadata' in row.keys() and row['metadata']:
+            try:
+                metadata = json.loads(row['metadata']) if isinstance(row['metadata'], str) else (row['metadata'] or {})
+            except (json.JSONDecodeError, TypeError):
+                metadata = {}
+        importance_weight = float(metadata.get('importance_weight', 1.0)) if isinstance(metadata, dict) else 1.0
+
+        staleness = _compute_staleness(row, now)
+        staleness_penalty = 1.0 - 0.3 * staleness
+
+        if signals >= threshold:
+            composite = (signal_weights + 0.5) * importance_weight * staleness_penalty
+        else:
+            composite = signal_weights * 0.1 * importance_weight * staleness_penalty
+        composite *= freq_boost
+
+        scored.append((composite, staleness, row, signals))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [(composite, staleness, row) for composite, staleness, row, _signals in scored]
+
+
 def cmd_recall(args, conn):
     # Semantic mode — call daemon API instead of SQLite
     if getattr(args, 'semantic', False):
         return _recall_semantic(args)
+    trace_enabled = getattr(args, 'trace', False)
+    trace_run_id = None
+    if trace_enabled:
+        cur = conn.execute(
+            """
+            INSERT INTO recall_trace(command, scope, query, tier, budget_chars)
+            VALUES ('recall', ?, ?, NULL, NULL)
+            """,
+            (args.scope, args.query),
+        )
+        trace_run_id = cur.lastrowid
+
+    def trace_event(step, payload):
+        if not trace_enabled or trace_run_id is None:
+            return
+        conn.execute(
+            """
+            INSERT INTO recall_trace_events(run_id, step, payload)
+            VALUES (?, ?, ?)
+            """,
+            (trace_run_id, step, json.dumps(payload)),
+        )
+
     clauses, values = build_memory_filters(args, table_alias='m')
     # Over-fetch 3x for reranking with frequency + staleness
     fetch_limit = args.limit * 3
@@ -801,9 +1029,9 @@ def cmd_recall(args, conn):
         except sqlite3.Error:
             fallback_clauses = [clause.replace('m.', '') for clause in clauses]
             fallback_values = list(values)
-            fallback_clauses.append('(content LIKE ? OR tags LIKE ?)')
+            fallback_clauses.append("(content LIKE ? OR (',' || tags || ',' LIKE ?))")
             query_term = f'%{args.query}%'
-            fallback_values.extend([query_term, query_term])
+            fallback_values.extend([query_term, f"%,{args.query.strip()},%"])
             where_sql = 'WHERE ' + ' AND '.join(fallback_clauses)
             sql = f"""
                 SELECT *, NULL AS rank
@@ -825,18 +1053,47 @@ def cmd_recall(args, conn):
         """
         rows = conn.execute(sql, (*values, fetch_limit)).fetchall()
 
+    trace_event('candidates_fts', {
+        'count': len(rows),
+        'ids': [row['id'] for row in rows],
+    })
+
     # Rerank with frequency + staleness scoring
     now = dt.datetime.now()
-    scored = _rerank_with_scores(conn, rows, now)
+    use_v2 = getattr(args, 'v2', False)
+    if use_v2:
+        scored = _rerank_with_activation(conn, rows, args, now)
+    else:
+        scored = _rerank_with_scores(conn, rows, now)
+    trace_event('reranked', {
+        'count': len(scored),
+        'results': [
+            {
+                'id': row['id'],
+                'composite': composite,
+                'staleness': staleness,
+                **({'signals': _activation_signal_count(row, args, now)} if use_v2 else {}),
+            }
+            for composite, staleness, row in scored
+        ],
+    })
     # Truncate to requested limit
     scored = scored[:args.limit]
     final_rows = [entry[2] for entry in scored]
+    trace_event('selected', {
+        'count': len(final_rows),
+        'ids': [row['id'] for row in final_rows],
+    })
     if args.json:
         print(json.dumps([memory_to_json(row) for row in final_rows], indent=2))
         _record_recall_access(conn, args, final_rows)
+        if trace_enabled:
+            conn.commit()
         return EXIT_OK
     if not scored:
         print('No memories found.')
+        if trace_enabled:
+            conn.commit()
         return EXIT_OK
     for composite, staleness, row in scored:
         memory_id = row['id']
@@ -848,7 +1105,13 @@ def cmd_recall(args, conn):
             stale_flag = color(' [STALE]', '33')
         elif staleness >= 0.4:
             stale_flag = color(' [aging]', '33')
-        print(color(title, '36') + f'  scope={scope}  created={created}' + stale_flag)
+        activation_flag = ''
+        if use_v2:
+            activation_flag = f"  signals={_activation_signal_count(row, args, now)}"
+        print(color(title, '36') + f'  scope={scope}  created={created}' + stale_flag + activation_flag)
+        headline = row['headline'] if 'headline' in row.keys() else None
+        if headline and not str(row['content']).startswith(headline):
+            print(f'  headline: {headline}')
         print(wrap_block('  content: ', row['content'], width=80))
         tags = ', '.join(split_tags(row['tags'])) if row['tags'] else '-'
         print(f'  tags: {tags}')
@@ -866,6 +1129,8 @@ def cmd_recall(args, conn):
             print(color(f'  \u26a0 May be outdated (last verified: {last_check}). Re-validate?', '33'))
         print()
     _record_recall_access(conn, args, final_rows)
+    if trace_enabled:
+        conn.commit()
     return EXIT_OK
 
 
@@ -946,8 +1211,8 @@ def cmd_search(args, conn):
     except sqlite3.Error:
         query_term = f"%{args.query}%"
         fallback_clauses = [clause.replace("m.", "") for clause in clauses]
-        fallback_clauses.append("(content LIKE ? OR tags LIKE ?)")
-        fallback_values = [*values, query_term, query_term, args.limit]
+        fallback_clauses.append("(content LIKE ? OR (',' || tags || ',' LIKE ?))")
+        fallback_values = [*values, query_term, f"%,{args.query.strip()},%", args.limit]
         where_sql = "WHERE " + " AND ".join(fallback_clauses)
         rows = conn.execute(
             f"""
@@ -1269,23 +1534,24 @@ def cmd_entities(args, conn):
             """
             SELECT * FROM memories
             WHERE deleted_at IS NULL
-              AND (scope = ? OR tags LIKE ?)
+              AND (scope = ? OR (',' || tags || ',' LIKE ?))
             ORDER BY created_at DESC
             LIMIT 50
             """,
-            (args.name, f"%{args.name}%"),
+            (args.name, f"%,{args.name.strip()},%"),
         ).fetchall()
+        entity_payload = row_to_dict(entity)
+        if entity_payload.get("metadata"):
+            entity_payload["metadata"] = json.loads(entity_payload["metadata"])
         payload = {
-            "entity": row_to_dict(entity),
+            "entity": entity_payload,
             "memories": [memory_to_json(row) for row in memories],
         }
-        if payload["entity"].get("metadata"):
-            payload["entity"]["metadata"] = json.loads(payload["entity"]["metadata"])
         if args.json:
             print(json.dumps(payload, indent=2))
         else:
             print(color(f"[{entity['id']}] {entity['name']} ({entity['type']})", "36"))
-            metadata = payload["entity"].get("metadata")
+            metadata = entity_payload.get("metadata")
             if metadata is not None:
                 print(f"  metadata: {json.dumps(metadata, ensure_ascii=True)}")
             print(f"  created: {humanize_datetime(entity['created_at'])}")
@@ -1814,7 +2080,11 @@ def cmd_stats(args, conn):
     schema_version = 0
     if schema_version_row is not None:
         try:
-            schema_version = int(decode_json_value(schema_version_row["value"]))
+            decoded_version = decode_json_value(schema_version_row["value"])
+            if isinstance(decoded_version, (int, float, str, bool)):
+                schema_version = int(decoded_version)
+            else:
+                schema_version = 0
         except (ValueError, TypeError, json.JSONDecodeError):
             schema_version = 0
 
@@ -2765,25 +3035,35 @@ def cmd_bootstrap(args, conn):
     budget = args.budget
     scope = args.scope
     now = dt.datetime.now()
+    tier = getattr(args, 'tier', 'l1')
+
+    def _format_bootstrap_content(content, max_len):
+        normalized = (content or '').replace("\n", " ").strip()
+        if tier == 'l2':
+            return normalized
+        if len(normalized) > max_len:
+            return normalized[: max_len - 3] + '...'
+        return normalized
 
     # --- Identity 1: hard constraints ---
     constraint_rows = conn.execute(
         """
-        SELECT id, content FROM memories
+        SELECT id, content, headline FROM memories
         WHERE type = 'preference'
           AND deleted_at IS NULL
           AND superseded_by IS NULL
           AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
-          AND tags LIKE '%hard-constraint%'
+          AND (',' || tags || ',' LIKE '%,hard-constraint,%')
         ORDER BY id ASC
         """,
     ).fetchall()
     constraint_lines = []
     for row in constraint_rows:
-        content = row["content"].replace("\n", " ").strip()
-        if len(content) > 120:
-            content = content[:117] + "..."
-        constraint_lines.append(f"- [{row['id']}] {content}")
+        if tier == 'l0':
+            constraint_text = row['headline'] or extract_headline(row['content'])
+        else:
+            constraint_text = _format_bootstrap_content(row['content'], 120)
+        constraint_lines.append(f"- [{row['id']}] {constraint_text}")
 
     # --- Identity 2: non-hard-constraint preferences ---
     preference_values = ()
@@ -2793,12 +3073,12 @@ def cmd_bootstrap(args, conn):
         preference_values = (scope,)
     preference_rows = conn.execute(
         f"""
-        SELECT id, content FROM memories
+        SELECT id, content, headline FROM memories
         WHERE type = 'preference'
           AND deleted_at IS NULL
           AND superseded_by IS NULL
           AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
-          AND (tags IS NULL OR tags NOT LIKE '%hard-constraint%')
+          AND (tags IS NULL OR NOT (',' || tags || ',' LIKE '%,hard-constraint,%'))
           {preference_scope_clause}
         ORDER BY created_at DESC, id DESC
         LIMIT 20
@@ -2807,10 +3087,11 @@ def cmd_bootstrap(args, conn):
     ).fetchall()
     preference_lines = []
     for row in preference_rows:
-        content = row["content"].replace("\n", " ").strip()
-        if len(content) > 120:
-            content = content[:117] + "..."
-        preference_lines.append(f"- [{row['id']}] {content}")
+        if tier == 'l0':
+            preference_text = row['headline'] or extract_headline(row['content'])
+        else:
+            preference_text = _format_bootstrap_content(row['content'], 120)
+        preference_lines.append(f"- [{row['id']}] {preference_text}")
 
     # --- Identity 3: active episode pointers ---
     episode_values = ()
@@ -2884,7 +3165,7 @@ def cmd_bootstrap(args, conn):
         for scope_name in active_scope_names:
             recent_rows = conn.execute(
                 """
-                SELECT id, type, content, created_at
+                SELECT id, type, content, headline, created_at
                 FROM memories
                 WHERE deleted_at IS NULL
                   AND superseded_by IS NULL
@@ -2896,9 +3177,10 @@ def cmd_bootstrap(args, conn):
                 (scope_name, recent_limit),
             ).fetchall()
             for row in recent_rows:
-                content = row["content"].replace("\n", " ").strip()
-                if len(content) > 100:
-                    content = content[:97] + "..."
+                if tier == 'l0':
+                    content = row['headline'] or extract_headline(row['content'])
+                else:
+                    content = _format_bootstrap_content(row['content'], 100)
                 age = humanize_datetime(row["created_at"], now)
                 recent_lines.append(f"- [{row['id']}] {scope_name} {row['type']}: {content} ({age})")
 
@@ -2924,9 +3206,7 @@ def cmd_bootstrap(args, conn):
             tuple(pattern_values),
         ).fetchall()
         for row in pattern_rows:
-            content = row["content"].replace("\n", " ").strip()
-            if len(content) > 100:
-                content = content[:97] + "..."
+            content = _format_bootstrap_content(row['content'], 100)
             marker = "x" if row["type"] == "failure" else "+"
             pattern_lines.append(f"- {marker} [{row['id']}] {content}")
 
@@ -3020,10 +3300,17 @@ def cmd_dream(args, conn):
         """,
         (cutoff, *scope_vals),
     ).fetchall()
-    report['stale_decisions'] = [
-        {'id': r['id'], 'scope': r['scope'], 'age_days': (now - parse_dt(r['updated_at'])).days,
-         'snippet': r['content'][:100]} for r in stale_rows
-    ]
+    report['stale_decisions'] = []
+    for r in stale_rows:
+        updated_at = parse_dt(r['updated_at'])
+        if updated_at is None:
+            continue
+        report['stale_decisions'].append({
+            'id': r['id'],
+            'scope': r['scope'],
+            'age_days': (now - updated_at).days,
+            'snippet': r['content'][:100],
+        })
 
     # 2. Expiring memories (approaching or past expires_at)
     lookahead = (now + dt.timedelta(days=DREAM_EXPIRY_LOOKAHEAD_DAYS)).isoformat(timespec='seconds')
@@ -3153,6 +3440,336 @@ def cmd_dream(args, conn):
 
     return EXIT_OK
 
+
+def _detect_relationships(conn, scope=None):
+    scope_clause = 'AND scope = ?' if scope else ''
+    scope_vals = (scope,) if scope else ()
+
+    rows = conn.execute(
+        f"""
+        SELECT id, type, scope, content, tags, created_at, headline
+        FROM memories
+        WHERE deleted_at IS NULL
+          AND superseded_by IS NULL
+          {scope_clause}
+        ORDER BY scope, created_at DESC
+        """,
+        scope_vals,
+    ).fetchall()
+
+    by_scope = {}
+    for row in rows:
+        scope_name = row['scope'] or 'global'
+        by_scope.setdefault(scope_name, []).append(row)
+
+    links = []
+    for scope_name, memories in by_scope.items():
+        if len(memories) < 2:
+            continue
+        for i, newer in enumerate(memories[:50]):
+            for older in memories[i + 1:min(i + 20, len(memories))]:
+                ratio = word_overlap_ratio(newer['content'], older['content'])
+
+                if ratio >= 0.80:
+                    links.append({
+                        'src_id': newer['id'],
+                        'dst_id': older['id'],
+                        'relation': 'DUPLICATE_OF',
+                        'note': f'word overlap {ratio:.0%}',
+                        'scope': scope_name,
+                        'overlap': round(ratio, 2),
+                    })
+                elif ratio >= 0.50:
+                    if newer['type'] == older['type']:
+                        links.append({
+                            'src_id': newer['id'],
+                            'dst_id': older['id'],
+                            'relation': 'SUPERSEDES',
+                            'note': f'same type+scope, overlap {ratio:.0%}',
+                            'scope': scope_name,
+                            'overlap': round(ratio, 2),
+                        })
+                    else:
+                        links.append({
+                            'src_id': newer['id'],
+                            'dst_id': older['id'],
+                            'relation': 'LINKED',
+                            'note': f'cross-type overlap {ratio:.0%}',
+                            'scope': scope_name,
+                            'overlap': round(ratio, 2),
+                        })
+                elif ratio >= 0.30:
+                    resolution_pairs = {
+                        ('decision', 'failure'),
+                        ('pattern', 'failure'),
+                    }
+                    if (newer['type'], older['type']) in resolution_pairs:
+                        links.append({
+                            'src_id': newer['id'],
+                            'dst_id': older['id'],
+                            'relation': 'RESOLVES',
+                            'note': f'{newer["type"]} resolves {older["type"]}, overlap {ratio:.0%}',
+                            'scope': scope_name,
+                            'overlap': round(ratio, 2),
+                        })
+
+    return links
+
+
+def cmd_curate(args, conn):
+    now = dt.datetime.now()
+    scope = getattr(args, 'scope', None)
+    stale_days = getattr(args, 'stale_days', DREAM_STALE_DAYS)
+    json_output = getattr(args, 'json_output', False) or getattr(args, 'json', False)
+    apply_changes = getattr(args, 'apply', False)
+    report = {}
+
+    scope_clause = 'AND scope = ?' if scope else ''
+    scope_vals = (scope,) if scope else ()
+    cutoff = (now - dt.timedelta(days=stale_days)).isoformat(timespec='seconds')
+    stale_rows = conn.execute(
+        f"""
+        SELECT id, type, scope, content, created_at, updated_at
+        FROM memories
+        WHERE type = 'decision'
+          AND deleted_at IS NULL
+          AND superseded_by IS NULL
+          AND updated_at < ?
+          {scope_clause}
+        ORDER BY updated_at ASC
+        LIMIT 20
+        """,
+        (cutoff, *scope_vals),
+    ).fetchall()
+    report['stale_decisions'] = []
+    for r in stale_rows:
+        updated_at = parse_dt(r['updated_at'])
+        if updated_at is None:
+            continue
+        report['stale_decisions'].append({
+            'id': r['id'],
+            'scope': r['scope'],
+            'age_days': (now - updated_at).days,
+            'snippet': r['content'][:100],
+        })
+
+    lookahead = (now + dt.timedelta(days=DREAM_EXPIRY_LOOKAHEAD_DAYS)).isoformat(timespec='seconds')
+    expiring_rows = conn.execute(
+        f"""
+        SELECT id, type, scope, content, expires_at
+        FROM memories
+        WHERE deleted_at IS NULL
+          AND superseded_by IS NULL
+          AND expires_at IS NOT NULL
+          AND expires_at <= ?
+          {scope_clause}
+        ORDER BY expires_at ASC
+        LIMIT 20
+        """,
+        (lookahead, *scope_vals),
+    ).fetchall()
+    report['expiring'] = [
+        {'id': r['id'], 'type': r['type'], 'scope': r['scope'],
+         'expires': r['expires_at'], 'snippet': r['content'][:100]} for r in expiring_rows
+    ]
+
+    contradiction_candidates = []
+    decision_rows = conn.execute(
+        f"""
+        SELECT id, scope, content, created_at
+        FROM memories
+        WHERE type = 'decision'
+          AND deleted_at IS NULL
+          AND superseded_by IS NULL
+          {scope_clause}
+        ORDER BY scope, created_at DESC
+        """,
+        scope_vals,
+    ).fetchall()
+    by_scope = {}
+    for row in decision_rows:
+        scope_name = row['scope'] or 'global'
+        by_scope.setdefault(scope_name, []).append(row)
+    for scope_name, decisions in by_scope.items():
+        if len(decisions) < 2:
+            continue
+        for i, newer in enumerate(decisions[:10]):
+            for older in decisions[i + 1:min(i + 11, len(decisions))]:
+                ratio = word_overlap_ratio(newer['content'], older['content'])
+                if ratio >= 0.40:
+                    contradiction_candidates.append({
+                        'newer_id': newer['id'],
+                        'older_id': older['id'],
+                        'scope': scope_name,
+                        'overlap': round(ratio, 2),
+                        'newer_snippet': newer['content'][:80],
+                        'older_snippet': older['content'][:80],
+                    })
+    report['contradiction_candidates'] = contradiction_candidates[:10]
+
+    recurring = find_recurring_patterns(conn, threshold=3)
+    report['recurring_patterns'] = {
+        tag: len(memories) for tag, memories in recurring.items()
+    } if recurring else {}
+
+    total = conn.execute('SELECT COUNT(*) AS c FROM memories WHERE deleted_at IS NULL').fetchone()['c']
+    oldest = conn.execute(
+        'SELECT MIN(created_at) AS oldest FROM memories WHERE deleted_at IS NULL'
+    ).fetchone()['oldest']
+    newest = conn.execute(
+        'SELECT MAX(created_at) AS newest FROM memories WHERE deleted_at IS NULL'
+    ).fetchone()['newest']
+    dup_total = conn.execute(
+        'SELECT COALESCE(SUM(duplicate_count), 0) AS c FROM memories'
+    ).fetchone()['c']
+    report['health'] = {
+        'total_active': total,
+        'oldest_memory': oldest,
+        'newest_memory': newest,
+        'duplicates_prevented': dup_total,
+        'stale_count': len(report['stale_decisions']),
+        'expiring_count': len(report['expiring']),
+        'contradiction_count': len(report['contradiction_candidates']),
+        'pattern_clusters': len(report['recurring_patterns']),
+    }
+
+    detected_relationships = _detect_relationships(conn, scope=scope)
+    links_created = 0
+    superseded_count = 0
+    duplicates_deleted = 0
+    relationship_rows = []
+
+    for link in detected_relationships:
+        exists = conn.execute(
+            """
+            SELECT 1 FROM memory_links
+            WHERE src_memory_id = ? AND dst_memory_id = ? AND relation = ?
+            """,
+            (link['src_id'], link['dst_id'], link['relation']),
+        ).fetchone()
+        is_new = exists is None
+
+        if apply_changes and is_new:
+            conn.execute(
+                """
+                INSERT INTO memory_links(src_memory_id, relation, dst_memory_id, note)
+                VALUES (?, ?, ?, ?)
+                """,
+                (link['src_id'], link['relation'], link['dst_id'], link['note']),
+            )
+            links_created += 1
+
+        if apply_changes and link['relation'] in ('SUPERSEDES', 'DUPLICATE_OF'):
+            res = conn.execute(
+                """
+                UPDATE memories
+                SET superseded_by = ?
+                WHERE id = ? AND superseded_by IS NULL
+                """,
+                (link['src_id'], link['dst_id']),
+            )
+            superseded_count += res.rowcount
+
+        if apply_changes and link['relation'] == 'DUPLICATE_OF':
+            res = conn.execute(
+                """
+                UPDATE memories
+                SET deleted_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND deleted_at IS NULL
+                """,
+                (link['dst_id'],),
+            )
+            duplicates_deleted += res.rowcount
+
+        relationship_rows.append({
+            'src_id': link['src_id'],
+            'dst_id': link['dst_id'],
+            'relation': link['relation'],
+            'note': link['note'],
+            'scope': link['scope'],
+            'is_new': is_new,
+        })
+
+    if apply_changes:
+        conn.commit()
+
+    new_relationship_rows = [row for row in relationship_rows if row['is_new']]
+    report['relationships'] = {
+        'detected_total': len(relationship_rows),
+        'detected_new': len(new_relationship_rows),
+        'links_created': links_created,
+        'superseded_count': superseded_count,
+        'duplicates_deleted': duplicates_deleted,
+        'apply': apply_changes,
+        'items': relationship_rows,
+    }
+
+    if json_output:
+        print(json.dumps(report, indent=2))
+        return EXIT_OK
+
+    print(color('=== Curator Report ===', '36'))
+    print()
+
+    h = report['health']
+    print(color('Memory Health:', '1'))
+    print(f'  Active memories: {h["total_active"]}  |  Duplicates prevented: {h["duplicates_prevented"]}')
+    print(f'  Oldest: {humanize_datetime(h["oldest_memory"])}  |  Newest: {humanize_datetime(h["newest_memory"])}')
+    print()
+
+    if report['stale_decisions']:
+        print(color(f'Stale Decisions ({len(report["stale_decisions"])} older than {stale_days}d):', '33'))
+        for item in report['stale_decisions']:
+            print(f'  [{item["id"]}] {item["age_days"]}d old  scope={item["scope"]}')
+            print(f'    {item["snippet"]}')
+        print()
+
+    if report['expiring']:
+        print(color(f'Expiring/Expired ({len(report["expiring"])}):', '31'))
+        for item in report['expiring']:
+            print(f'  [{item["id"]}] {item["type"]}  expires={humanize_datetime(item["expires"])}')
+            print(f'    {item["snippet"]}')
+        print()
+
+    if report['contradiction_candidates']:
+        print(color(f'Contradiction Candidates ({len(report["contradiction_candidates"])}):', '33'))
+        for item in report['contradiction_candidates']:
+            print(f'  [{item["newer_id"]}] vs [{item["older_id"]}]  scope={item["scope"]}  overlap={item["overlap"]}')
+            print(f'    newer: {item["newer_snippet"]}')
+            print(f'    older: {item["older_snippet"]}')
+        print()
+
+    if report['recurring_patterns']:
+        print(color(f'Recurring Pattern Clusters ({len(report["recurring_patterns"])}):', '36'))
+        for tag, count in sorted(report['recurring_patterns'].items(), key=lambda x: -x[1]):
+            print(f'  {tag}: {count} occurrences')
+        print()
+
+    if not any([
+        report['stale_decisions'],
+        report['expiring'],
+        report['contradiction_candidates'],
+        report['recurring_patterns'],
+    ]):
+        print(color('All clear - no issues found.', '32'))
+        print()
+
+    print(color(f'Relationships Detected ({len(new_relationship_rows)} new):', '1'))
+    for item in new_relationship_rows:
+        print(f'  [{item["src_id"]}] {item["relation"]} [{item["dst_id"]}] - {item["note"]}')
+    if not new_relationship_rows:
+        print('  None')
+    print()
+
+    print(f'Links Created: {links_created}')
+    print(f'Superseded: {superseded_count} memories marked as superseded')
+    if apply_changes:
+        print(f'Duplicates Soft-Deleted: {duplicates_deleted}')
+    else:
+        print('Dry run: no changes applied (use --apply to persist links/supersedes/deletes).')
+
+    return EXIT_OK
+
 def capture_memory(conn, mem_type, scope, content, tags=None):
     """Helper to insert a memory record directly."""
     cur = conn.execute(
@@ -3193,7 +3810,8 @@ def cmd_model(args, conn):
         print()
         print(color('Fallback Chain:', '1'))
         for item in policy.get('fallback_chain', []):
-            print(f"  Tier {item['tier']}: {item['model']} ({item['condition']})")
+            if isinstance(item, dict):
+                print(f"  Tier {item.get('tier', '?')}: {item.get('model', '?')} ({item.get('condition', '?')})")
         print()
         print(color('Escalation Criteria:', '1'))
         for criterion in policy.get('escalation_criteria', []):
@@ -3238,7 +3856,7 @@ def cmd_model(args, conn):
             """
             SELECT id, type, content, tags, created_at
             FROM memories
-            WHERE (content LIKE '%model%' OR tags LIKE '%model%')
+            WHERE (content LIKE '%model%' OR (',' || tags || ',' LIKE '%,model,%'))
               AND created_at > ?
               AND deleted_at IS NULL
             ORDER BY created_at DESC
@@ -3406,4 +4024,3 @@ def cmd_model(args, conn):
         return EXIT_OK
     
     return fail(f"Unknown model command: {args.model_command}")
-

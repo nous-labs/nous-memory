@@ -6,7 +6,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from .core import EXIT_OK, color, connect_db, ensure_schema, fail, log_verbose, resolve_db_path
+from .core import EXIT_OK, color, connect_db, ensure_schema, fail, log_verbose, resolve_db_path, cmd_curate
 from .memory import cmd_capture, cmd_recall, cmd_search, cmd_get, cmd_timeline, cmd_update, cmd_forget
 from .tasks import cmd_tasks, cmd_remind
 from .entities import cmd_entities
@@ -42,6 +42,7 @@ def build_parser():
     capture.add_argument("--source")
     capture.add_argument("--expires", help="expiry date/time (ISO or relative)")
     capture.add_argument("--topic-key", help="stable topic identifier for in-place updates")
+    capture.add_argument("--headline", help="explicit headline (default: first sentence)")
     capture.add_argument("--no-synthesis", action="store_true", help="skip duplicate/similarity detection")
     capture.add_argument("content", nargs="?")
     capture.add_argument("--content", dest="content_flag", help="memory content text")
@@ -53,6 +54,8 @@ def build_parser():
     recall.add_argument("--tags")
     recall.add_argument("--limit", type=int, default=20)
     recall.add_argument("--active", action="store_true")
+    recall.add_argument("--trace", action="store_true", help="log retrieval trajectory")
+    recall.add_argument("--v2", action="store_true", help="use activation-based scoring (4-signal model)")
 
     recall.add_argument("--semantic", action="store_true",
                         help="use semantic search via daemon API (hybrid vector + keyword)")
@@ -176,6 +179,7 @@ def build_parser():
     bootstrap.add_argument("--scope", help="project scope filter")
     bootstrap.add_argument("--budget", type=int, default=4000, help="max chars (default: 4000)")
     bootstrap.add_argument("--recent-limit", type=int, default=5, help="max recent memories (default: 5)")
+    bootstrap.add_argument("--tier", choices=["l0", "l1", "l2"], default="l1", help="output tier: l0=headlines, l1=default, l2=verbose")
     bootstrap.add_argument("--handoff", action="store_true", help="include tasks, context, and patterns")
 
 
@@ -184,6 +188,12 @@ def build_parser():
     dream.add_argument("--scope", help="scope filter")
     dream.add_argument("--stale-days", type=int, default=30, help="stale decision threshold (default: 30)")
     dream.add_argument("--json", dest="json_output", action="store_true", help="JSON output")
+
+    curate = subparsers.add_parser("curate", help="extended dream: detect relationships between memories")
+    curate.add_argument("--scope", help="scope filter")
+    curate.add_argument("--apply", action="store_true", help="apply changes (supersede duplicates, create links)")
+    curate.add_argument("--json", dest="json_output", action="store_true", help="JSON output")
+    curate.add_argument("--stale-days", type=int, default=30, help="stale decision threshold")
 
     prompt = subparsers.add_parser("prompt", help="manage agent prompt (AGENTS.md)")
     prompt_sub = prompt.add_subparsers(dest="prompt_command")
@@ -319,6 +329,8 @@ def run(args):
 
         if args.command == "dream":
             return cmd_dream(args, conn)
+        if args.command == "curate":
+            return cmd_curate(args, conn)
         if args.command == 'bridge':
             return cmd_bridge(args, conn)
 
