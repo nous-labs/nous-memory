@@ -184,6 +184,7 @@ def build_parser():
     bootstrap.add_argument("--recent-limit", type=int, default=5, help="max recent memories (default: 5)")
     bootstrap.add_argument("--tier", choices=["l0", "l1", "l2"], default="l1", help="output tier: l0=headlines, l1=default, l2=verbose")
     bootstrap.add_argument("--handoff", action="store_true", help="include tasks, context, and patterns")
+    bootstrap.add_argument("--full", action="store_true", dest="full_constraints", help="load all hard-constraints, not just critical ones")
 
 
 

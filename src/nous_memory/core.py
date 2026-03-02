@@ -3076,6 +3076,7 @@ def cmd_bootstrap(args, conn):
     scope = args.scope
     now = dt.datetime.now()
     tier = getattr(args, 'tier', 'l1')
+    critical_only = getattr(args, 'critical_only', not getattr(args, 'full_constraints', False))
 
     def _format_bootstrap_content(content, max_len):
         normalized = (content or '').replace("\n", " ").strip()
@@ -3086,14 +3087,20 @@ def cmd_bootstrap(args, conn):
         return normalized
 
     # --- Identity 1: hard constraints ---
+    # When critical_only=True (default), load only constraints tagged 'critical'
+    # for minimal post-compaction context. Use critical_only=False for full set.
+    if critical_only:
+        constraint_tag_filter = "AND (',' || tags || ',' LIKE '%,critical,%')"
+    else:
+        constraint_tag_filter = "AND (',' || tags || ',' LIKE '%,hard-constraint,%')"
     constraint_rows = conn.execute(
-        """
+        f"""
         SELECT id, content, headline FROM memories
         WHERE type = 'preference'
           AND deleted_at IS NULL
           AND superseded_by IS NULL
           AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
-          AND (',' || tags || ',' LIKE '%,hard-constraint,%')
+          {constraint_tag_filter}
           AND NOT (metadata IS NOT NULL AND json_extract(metadata, '$.auto_extracted') = 1 AND verified_at IS NULL)
         ORDER BY id ASC
         """,
@@ -3136,6 +3143,21 @@ def cmd_bootstrap(args, conn):
         preference_lines.append(f"- [{row['id']}] {preference_text}")
 
     # --- Identity 3: active episode pointers ---
+    # Auto-close episodes older than 24h
+    stale_cutoff = (now - dt.timedelta(hours=24)).isoformat(timespec='seconds')
+    conn.execute(
+        """
+        UPDATE episodes
+        SET status = 'done',
+            ended_at = CURRENT_TIMESTAMP,
+            summary = COALESCE(summary, '') || ' [auto-closed: stale >24h]'
+        WHERE status = 'active'
+          AND started_at < ?
+        """,
+        (stale_cutoff,),
+    )
+    conn.commit()
+
     episode_values = ()
     episode_scope_clause = ""
     if scope:
@@ -3268,11 +3290,39 @@ def cmd_bootstrap(args, conn):
         unverified_scope_vals,
     ).fetchone()['c']
 
+    # --- News: recent news observations (last 48h, tagged 'news') ---
+    # Load critical news first, then recent, capped at 3 total
+    news_cutoff = (now - dt.timedelta(hours=48)).isoformat(timespec='seconds')
+    news_rows = conn.execute(
+        """
+        SELECT id, content, tags, created_at FROM memories
+        WHERE type = 'observation'
+          AND deleted_at IS NULL
+          AND superseded_by IS NULL
+          AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
+          AND (',' || tags || ',' LIKE '%,news,%')
+          AND created_at > ?
+        ORDER BY
+          CASE WHEN (',' || tags || ',' LIKE '%,critical,%') THEN 0 ELSE 1 END,
+          created_at DESC
+        LIMIT 3
+        """,
+        (news_cutoff,),
+    ).fetchall()
+    news_lines = []
+    for row in news_rows:
+        content = _format_bootstrap_content(row['content'], 150)
+        is_critical = ',critical,' in (',' + (row['tags'] or '') + ',')
+        prefix = '🔴' if is_critical else '📰'
+        news_lines.append(f"- {prefix} [{row['id']}] {content}")
+
     sections = [
         ("Constraints", constraint_lines),
         ("Preferences", preference_lines),
         ("Episodes", episode_lines),
     ]
+    if news_lines:
+        sections.append(("News (last 48h)", news_lines))
     if args.handoff:
         sections.extend([
             ("Alerts", alert_lines),
@@ -3313,6 +3363,7 @@ def cmd_bootstrap(args, conn):
                 "tasks": len(task_lines),
                 "recent": len(recent_lines),
                 "patterns": len(pattern_lines),
+                "news": len(news_lines),
             },
             "unverified_auto_extracted": unverified_count,
             "output": result,
