@@ -1663,8 +1663,9 @@ def cmd_kv(args, conn):
     if args.kv_command == "set":
         try:
             parsed = json.loads(args.value)
-        except json.JSONDecodeError as exc:
-            return fail(f"invalid JSON value: {exc}")
+        except json.JSONDecodeError:
+            # Treat bare strings as plain string values
+            parsed = args.value
         encoded = json.dumps(parsed, separators=(",", ":"))
         conn.execute(
             """
