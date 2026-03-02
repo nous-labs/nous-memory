@@ -27,7 +27,7 @@ else:
     _MCP_IMPORT_ERROR = None
 
 
-from nous_memory import bootstrap, bridge, core, dream, entities, episodes, kv, memory, models, patterns, prompt, sessions, stats, tasks
+from nous_memory import bootstrap, bridge, core, dream, entities as entities_mod, episodes as episodes_mod, kv as kv_mod, memory, models as models_mod, patterns, prompt, sessions as sessions_mod, stats, tasks as tasks_mod
 
 # ---------------------------------------------------------------------------
 # MCP server
@@ -93,7 +93,7 @@ def _call(cmd_func, **kwargs):
 
 
 # ===========================================================================
-# Memory tools
+# Memory tools (3 high-use tools kept separate)
 # ===========================================================================
 
 
@@ -126,7 +126,7 @@ def memory_capture(
         memory.cmd_capture,
         type=type, content=content, scope=scope, tags=tags,
         source=source, expires=expires, topic_key=topic_key,
-        no_synthesis=no_synthesis, metadata=metadata,
+        no_synthesis=no_synthesis, metadata=metadata, headline=None,
     )
 
 
@@ -187,138 +187,89 @@ def memory_search(
     )
 
 
-@_tool()
-def memory_get(id: int) -> dict:
-    """Get full details for a single memory by its ID."""
-    return _call(memory.cmd_get, id=id)
-
-
-@_tool()
-def memory_timeline(id: int) -> dict:
-    """Show ±24 hour context around a memory — what was captured before and after."""
-    return _call(memory.cmd_timeline, id=id)
-
-
-@_tool()
-def memory_update(id: int, content: str) -> dict:
-    """Update a memory by creating a new version that supersedes the old one.
-
-    Args:
-        id: Memory ID to supersede.
-        content: New content for the memory.
-    """
-    return _call(memory.cmd_update, id=id, content=content)
-
-
-@_tool()
-def memory_forget(id: int, hard: bool = False) -> dict:
-    """Delete a memory. Soft-delete by default (recoverable). Use hard=True for permanent removal.
-
-    Args:
-        id: Memory ID to delete.
-        hard: If True, permanently delete (cannot be recovered).
-    """
-    return _call(memory.cmd_forget, id=id, hard=hard)
-
-@_tool()
-def memory_verify(id: int) -> dict:
-    """Verify an auto-extracted memory, promoting it to trusted status.
-
-    Sets verified_at timestamp, removes TTL expiry, and includes the memory in bootstrap.
-    Use this after reviewing auto-extracted memories shown by curate.
-
-    Args:
-        id: Memory ID to verify.
-    """
-    return _call(core.cmd_verify, id=id)
-
-
 # ===========================================================================
-# Bootstrap & analysis
+# Memory operations (5 minor ops consolidated into 1)
 # ===========================================================================
 
 
 @_tool()
-def memory_bootstrap(
+def memory_ops(
+    action: str,
+    id: Optional[int] = None,
+    content: Optional[str] = None,
+    hard: bool = False,
+) -> dict:
+    """Memory operations: get, timeline, update, forget, verify.
+
+    Args:
+        action: One of: get, timeline, update, forget, verify.
+        id: Memory ID (required for all actions).
+        content: New content (required for update action).
+        hard: Permanent delete (only for forget action, default: False).
+    """
+    if action == "get":
+        return _call(memory.cmd_get, id=id)
+    elif action == "timeline":
+        return _call(memory.cmd_timeline, id=id)
+    elif action == "update":
+        return _call(memory.cmd_update, id=id, content=content)
+    elif action == "forget":
+        return _call(memory.cmd_forget, id=id, hard=hard)
+    elif action == "verify":
+        return _call(core.cmd_verify, id=id)
+    else:
+        return {"error": f"Unknown action: {action}. Use: get, timeline, update, forget, verify"}
+
+
+# ===========================================================================
+# Bootstrap & analysis (consolidated)
+# ===========================================================================
+
+
+@_tool()
+def memory_analyze(
+    action: str,
     scope: Optional[str] = None,
     budget: int = 4000,
     recent_limit: int = 5,
-) -> dict:
-    """Token-budgeted session context injection.
-
-    Returns prioritized context within a character budget:
-    1. Constraints (hard-constraint preferences — always included)
-    2. Alerts (due/overdue tasks)
-    3. Tasks (all pending)
-    4. Recent decisions/observations for scope
-    5. Patterns (failures and patterns for scope)
-
-    Args:
-        scope: Project scope filter (e.g. "nous-memory").
-        budget: Max characters for output (default: 4000).
-        recent_limit: Max recent memories to include (default: 5).
-    """
-    return _call(
-        bootstrap.cmd_bootstrap,
-        scope=scope, budget=budget, recent_limit=recent_limit, handoff=False,
-    )
-
-
-@_tool()
-def memory_dream(
-    scope: Optional[str] = None,
     stale_days: int = 30,
 ) -> dict:
-    """Background dreaming — idle-time memory re-evaluation.
-
-    Produces a report with:
-    - Stale decisions (older than stale_days, may need review)
-    - Expiring memories (approaching expires_at)
-    - Contradiction candidates (overlapping active decisions)
-    - Recurring pattern clusters
-    - Memory health statistics
+    """Memory analysis: bootstrap context, dream analysis, or stats.
 
     Args:
-        scope: Scope filter (e.g. project name).
-        stale_days: Threshold in days for stale decisions (default: 30).
+        action: One of: bootstrap, dream, stats.
+        scope: Project scope filter (for bootstrap/dream).
+        budget: Max characters for bootstrap output (default: 4000).
+        recent_limit: Max recent memories for bootstrap (default: 5).
+        stale_days: Threshold for stale decisions in dream (default: 30).
     """
-    return _call(
-        dream.cmd_dream,
-        scope=scope, stale_days=stale_days, command="dream",
-    )
-
-
-@_tool()
-def memory_stats() -> dict:
-    """Show memory system statistics — counts by type, search index status, tasks, entities, DB size."""
-    return _call(stats.cmd_stats)
+    if action == "bootstrap":
+        return _call(
+            bootstrap.cmd_bootstrap,
+            scope=scope, budget=budget, recent_limit=recent_limit, handoff=False,
+            critical_only=True,
+        )
+    elif action == "dream":
+        return _call(
+            dream.cmd_dream,
+            scope=scope, stale_days=stale_days, command="dream",
+        )
+    elif action == "stats":
+        return _call(stats.cmd_stats)
+    else:
+        return {"error": f"Unknown action: {action}. Use: bootstrap, dream, stats"}
 
 
 # ===========================================================================
-# Task tools
+# Task tools (consolidated)
 # ===========================================================================
 
 
 @_tool()
-def task_list(
-    all: bool = False,
-    due: bool = False,
-) -> list | dict:
-    """List tasks.
-
-    Args:
-        all: Include all statuses (pending, active, done, cancelled). Default: pending only.
-        due: Show only overdue and due-within-24h tasks.
-    """
-    return _call(
-        tasks.cmd_tasks,
-        tasks_command=None, all=all, due=due,
-    )
-
-
-@_tool()
-def task_add(
-    title: str,
+def task(
+    action: str,
+    id: Optional[int] = None,
+    title: Optional[str] = None,
     priority: str = "medium",
     due: Optional[str] = None,
     description: Optional[str] = None,
@@ -326,465 +277,332 @@ def task_add(
     entity_id: Optional[int] = None,
     entity_name: Optional[str] = None,
     tags: Optional[str] = None,
-) -> dict:
-    """Add a new task.
+    all: bool = False,
+) -> list | dict:
+    """Task management: list, add, done, cancel, remind.
 
     Args:
-        title: Task title.
-        priority: low, medium (default), high, or critical.
-        due: Due date — ISO format or relative (tomorrow, in 3 days, next monday).
-        description: Optional longer description.
-        repeat_rule: Cron expression for recurring tasks.
-        entity_id: Link to entity by ID.
-        entity_name: Link to entity by name.
-        tags: Comma-separated tags.
+        action: One of: list, add, done, cancel, remind.
+        id: Task ID (for done/cancel).
+        title: Task title (for add/remind).
+        priority: low, medium (default), high, or critical (for add).
+        due: Due date — ISO format or relative (for add/remind).
+        description: Optional description (for add).
+        repeat_rule: Cron expression for recurring tasks (for add).
+        entity_id: Link to entity by ID (for add).
+        entity_name: Link to entity by name (for add).
+        tags: Comma-separated tags (for add).
+        all: Include all statuses in list (default: pending only).
     """
-    return _call(
-        tasks.cmd_tasks,
-        tasks_command="add", title=title, priority=priority,
-        due=due, description=description, repeat_rule=repeat_rule,
-        entity_id=entity_id, entity_name=entity_name, tags=tags,
-        all=False,
-    )
-
-
-@_tool()
-def task_done(id: int) -> dict:
-    """Mark a task as done.
-
-    Args:
-        id: Task ID to mark complete.
-    """
-    return _call(tasks.cmd_tasks, tasks_command="done", id=id, all=False, due=False)
-
-
-@_tool()
-def task_cancel(id: int) -> dict:
-    """Cancel a task.
-
-    Args:
-        id: Task ID to cancel.
-    """
-    return _call(tasks.cmd_tasks, tasks_command="cancel", id=id, all=False, due=False)
-
-
-@_tool()
-def remind(when: str, title: str) -> dict:
-    """Create a reminder task with a due date.
-
-    Args:
-        when: Due date — ISO format or relative (tomorrow, in 3 days, next monday, 2026-03-12).
-        title: Reminder description.
-    """
-    return _call(tasks.cmd_remind, when=when, title=title)
+    if action == "list":
+        return _call(tasks_mod.cmd_tasks, tasks_command=None, all=all, due=False)
+    elif action == "add":
+        return _call(
+            tasks_mod.cmd_tasks,
+            tasks_command="add", title=title, priority=priority,
+            due=due, description=description, repeat_rule=repeat_rule,
+            entity_id=entity_id, entity_name=entity_name, tags=tags,
+            all=False,
+        )
+    elif action == "done":
+        return _call(tasks_mod.cmd_tasks, tasks_command="done", id=id, all=False, due=False)
+    elif action == "cancel":
+        return _call(tasks_mod.cmd_tasks, tasks_command="cancel", id=id, all=False, due=False)
+    elif action == "remind":
+        return _call(tasks_mod.cmd_remind, when=due, title=title)
+    else:
+        return {"error": f"Unknown action: {action}. Use: list, add, done, cancel, remind"}
 
 
 # ===========================================================================
-# Entity tools
+# Entity tools (consolidated)
 # ===========================================================================
 
 
 @_tool()
-def entity_add(type: str, name: str, metadata: Optional[str] = None) -> dict:
-    """Add a new entity.
+def entity(
+    action: str,
+    name: Optional[str] = None,
+    type: Optional[str] = None,
+    metadata: Optional[str] = None,
+) -> list | dict:
+    """Entity management: add, show, list.
 
     Args:
-        type: Entity type — project, provider, tool, person, or repo.
-        name: Unique entity name.
-        metadata: Optional JSON string with additional data.
+        action: One of: add, show, list.
+        name: Entity name (for add/show).
+        type: Entity type — project, provider, tool, person, or repo (for add).
+        metadata: Optional JSON string with additional data (for add).
     """
-    return _call(
-        entities.cmd_entities,
-        entities_command="add", type=type, name=name, metadata=metadata,
-    )
-
-
-@_tool()
-def entity_show(name: str) -> dict:
-    """Show entity details and all linked memories.
-
-    Args:
-        name: Entity name to look up.
-    """
-    return _call(entities.cmd_entities, entities_command="show", name=name)
-
-
-@_tool()
-def entity_list() -> list | dict:
-    """List all entities with their types and metadata."""
-    return _call(entities.cmd_entities, entities_command=None)
+    if action == "add":
+        return _call(entities_mod.cmd_entities, entities_command="add", type=type, name=name, metadata=metadata)
+    elif action == "show":
+        return _call(entities_mod.cmd_entities, entities_command="show", name=name)
+    elif action == "list":
+        return _call(entities_mod.cmd_entities, entities_command=None)
+    else:
+        return {"error": f"Unknown action: {action}. Use: add, show, list"}
 
 
 # ===========================================================================
-# Session tools
+# Session tools (consolidated)
 # ===========================================================================
 
 
 @_tool()
-def session_log(
-    id: str,
+def session(
+    action: str,
+    id: Optional[str] = None,
+    session_id: Optional[str] = None,
     summary: Optional[str] = None,
     files: Optional[str] = None,
     decisions: Optional[str] = None,
+    limit: int = 20,
+) -> list | dict:
+    """Session reference management: log, list, show.
+
+    Args:
+        action: One of: log, list, show.
+        id: Session identifier (for log).
+        session_id: Session ID to look up (for show).
+        summary: Brief session summary (for log).
+        files: JSON array of modified files (for log).
+        decisions: JSON array of decisions made (for log).
+        limit: Max sessions to return (for list, default: 20).
+    """
+    if action == "log":
+        return _call(sessions_mod.cmd_session, session_command="log", id=id, summary=summary, files=files, decisions=decisions)
+    elif action == "list":
+        return _call(sessions_mod.cmd_session, session_command="list", limit=limit)
+    elif action == "show":
+        return _call(sessions_mod.cmd_session, session_command="show", session_id=session_id)
+    else:
+        return {"error": f"Unknown action: {action}. Use: log, list, show"}
+
+
+# ===========================================================================
+# KV tools (consolidated)
+# ===========================================================================
+
+
+@_tool()
+def kv(
+    action: str,
+    key: Optional[str] = None,
+    value: Optional[str] = None,
+) -> list | dict:
+    """Key-value store: get, set, list, delete.
+
+    Args:
+        action: One of: get, set, list, delete.
+        key: Key name (for get/set/delete).
+        value: JSON string value (for set).
+    """
+    if action == "get":
+        return _call(kv_mod.cmd_kv, kv_command="get", key=key)
+    elif action == "set":
+        return _call(kv_mod.cmd_kv, kv_command="set", key=key, value=value)
+    elif action == "list":
+        return _call(kv_mod.cmd_kv, kv_command=None, key=None)
+    elif action == "delete":
+        return _call(kv_mod.cmd_kv, kv_command="delete", key=key)
+    else:
+        return {"error": f"Unknown action: {action}. Use: get, set, list, delete"}
+
+
+# ===========================================================================
+# Episode tools (consolidated)
+# ===========================================================================
+
+
+@_tool()
+def episode(
+    action: str,
+    scope: Optional[str] = None,
+    intent: Optional[str] = None,
+    summary: Optional[str] = None,
+    limit: int = 20,
+) -> list | dict:
+    """Episode management: start, end, list, current.
+
+    Args:
+        action: One of: start, end, list, current.
+        scope: Project scope (for start/end/list/current).
+        intent: What this episode is about (for start).
+        summary: Episode summary (for end).
+        limit: Max results (for list, default: 20).
+    """
+    if action == "start":
+        return _call(episodes_mod.cmd_episode, episode_command="start", scope=scope, intent=intent)
+    elif action == "end":
+        return _call(episodes_mod.cmd_episode, episode_command="end", scope=scope, summary=summary)
+    elif action == "list":
+        return _call(episodes_mod.cmd_episode, episode_command="list", scope=scope, limit=limit)
+    elif action == "current":
+        return _call(episodes_mod.cmd_episode, episode_command="current", scope=scope)
+    else:
+        return {"error": f"Unknown action: {action}. Use: start, end, list, current"}
+
+
+# ===========================================================================
+# Pattern analysis tools (consolidated)
+# ===========================================================================
+
+
+@_tool()
+def pattern(
+    action: str,
+    threshold: int = 3,
+    include_all: bool = False,
+    tag: Optional[str] = None,
 ) -> dict:
-    """Log a session reference for cross-session continuity.
+    """Pattern analysis: analyze clusters, suggest improvements, propose changes, sync to markdown.
 
     Args:
-        id: Session identifier.
-        summary: Brief session summary.
-        files: JSON array of modified files.
-        decisions: JSON array of decisions made.
-    """
-    return _call(
-        sessions.cmd_session,
-        session_command="log", id=id, summary=summary,
-        files=files, decisions=decisions,
-    )
-
-
-@_tool()
-def session_list(limit: int = 20) -> list | dict:
-    """List recent session references.
-
-    Args:
-        limit: Max sessions to return (default: 20).
-    """
-    return _call(sessions.cmd_session, session_command="list", limit=limit)
-
-
-@_tool()
-def session_show(session_id: str) -> dict:
-    """Show full details for a session reference.
-
-    Args:
-        session_id: Session ID to look up.
-    """
-    return _call(sessions.cmd_session, session_command="show", session_id=session_id)
-
-
-# ===========================================================================
-# KV tools
-# ===========================================================================
-
-
-@_tool()
-def kv_get(key: str) -> dict:
-    """Get a value from the key-value store.
-
-    Args:
-        key: Key to look up.
-    """
-    return _call(kv.cmd_kv, kv_command="get", key=key)
-
-
-@_tool()
-def kv_set(key: str, value: str) -> dict:
-    """Set a value in the key-value store.
-
-    Args:
-        key: Key to set.
-        value: JSON string value.
-    """
-    return _call(kv.cmd_kv, kv_command="set", key=key, value=value)
-
-
-@_tool()
-def kv_list() -> list | dict:
-    """List all key-value entries."""
-    return _call(kv.cmd_kv, kv_command=None, key=None)
-
-
-@_tool()
-def kv_delete(key: str) -> dict:
-    """Delete a key from the key-value store.
-
-    Args:
-        key: Key to delete.
-    """
-    return _call(kv.cmd_kv, kv_command="delete", key=key)
-
-
-# ===========================================================================
-# Episode tools
-# ===========================================================================
-
-
-@_tool()
-def episode_start(scope: str, intent: Optional[str] = None) -> dict:
-    """Start a new episode for a scope.
-
-    Args:
-        scope: Project scope (e.g. "nous-memory").
-        intent: What this episode is about.
-    """
-    return _call(episodes.cmd_episode, episode_command="start", scope=scope, intent=intent)
-
-
-@_tool()
-def episode_end(scope: Optional[str] = None, summary: Optional[str] = None) -> dict:
-    """End the current active episode.
-
-    Args:
-        scope: Scope to end episode for (optional if only one active).
-        summary: Episode summary.
-    """
-    return _call(episodes.cmd_episode, episode_command="end", scope=scope, summary=summary)
-
-
-@_tool()
-def episode_list(scope: Optional[str] = None, limit: int = 20) -> list | dict:
-    """List episodes.
-
-    Args:
-        scope: Filter by scope.
-        limit: Max results (default: 20).
-    """
-    return _call(episodes.cmd_episode, episode_command="list", scope=scope, limit=limit)
-
-
-@_tool()
-def episode_current(scope: Optional[str] = None) -> dict:
-    """Show current active episode.
-
-    Args:
-        scope: Filter by scope.
-    """
-    return _call(episodes.cmd_episode, episode_command="current", scope=scope)
-
-
-# ===========================================================================
-# Pattern analysis tools
-# ===========================================================================
-
-
-@_tool()
-def patterns_analyze(threshold: int = 3, include_all: bool = False) -> dict:
-    """Find recurring tag clusters in failure/pattern memories.
-
-    Args:
+        action: One of: analyze, suggest, propose, sync.
         threshold: Minimum occurrences to count as recurring (default: 3).
-        include_all: Include all memory types, not just failure/pattern.
+        include_all: Include all memory types in analyze (default: False).
+        tag: Tag to generate proposal from (for propose).
     """
-    return _call(patterns.cmd_patterns, patterns_command="analyze", threshold=threshold, include_all=include_all)
-
-
-@_tool()
-def patterns_suggest(threshold: int = 3) -> dict:
-    """Suggest prompt improvements from recurring patterns.
-
-    Args:
-        threshold: Minimum occurrences (default: 3).
-    """
-    return _call(patterns.cmd_patterns, patterns_command="suggest", threshold=threshold)
-
-
-@_tool()
-def patterns_propose(tag: str, threshold: int = 3) -> dict:
-    """Auto-generate a prompt change proposal from a recurring tag.
-
-    Args:
-        tag: Tag to generate proposal from.
-        threshold: Minimum occurrences (default: 3).
-    """
-    return _call(patterns.cmd_patterns, patterns_command="propose", tag=tag, threshold=threshold)
-
-
-@_tool()
-def patterns_sync() -> dict:
-    """Sync failure/pattern memories to knowledge markdown files."""
-    return _call(patterns.cmd_patterns, patterns_command="sync")
+    if action == "analyze":
+        return _call(patterns.cmd_patterns, patterns_command="analyze", threshold=threshold, include_all=include_all)
+    elif action == "suggest":
+        return _call(patterns.cmd_patterns, patterns_command="suggest", threshold=threshold)
+    elif action == "propose":
+        return _call(patterns.cmd_patterns, patterns_command="propose", tag=tag, threshold=threshold)
+    elif action == "sync":
+        return _call(patterns.cmd_patterns, patterns_command="sync")
+    else:
+        return {"error": f"Unknown action: {action}. Use: analyze, suggest, propose, sync"}
 
 
 # ===========================================================================
-# Prompt management tools
+# Prompt management tools (consolidated)
 # ===========================================================================
 
 
 @_tool()
-def prompt_show() -> dict:
-    """Show the active AGENTS.md prompt content and version."""
-    return _call(prompt.cmd_prompt, prompt_command="show")
-
-
-@_tool()
-def prompt_snapshot(message: Optional[str] = None) -> dict:
-    """Snapshot the current prompt version.
-
-    Args:
-        message: Snapshot description message.
-    """
-    return _call(prompt.cmd_prompt, prompt_command="snapshot", message=message)
-
-
-@_tool()
-def prompt_propose(description: str, file: Optional[str] = None) -> dict:
-    """Create a prompt change proposal.
-
-    Args:
-        description: Brief description of the proposed change.
-        file: Optional source file with proposed content.
-    """
-    return _call(prompt.cmd_prompt, prompt_command="propose", description=description, file=file)
-
-
-@_tool()
-def prompt_proposals(all: bool = False) -> list | dict:
-    """List prompt change proposals.
-
-    Args:
-        all: Include all statuses, not just pending.
-    """
-    return _call(prompt.cmd_prompt, prompt_command="proposals", all=all)
-
-
-@_tool()
-def prompt_apply(proposal_id: int) -> dict:
-    """Apply a pending prompt proposal to AGENTS.md.
-
-    Args:
-        proposal_id: ID of the proposal to apply.
-    """
-    return _call(prompt.cmd_prompt, prompt_command="apply", proposal_id=proposal_id)
-
-
-@_tool()
-def prompt_reject(proposal_id: int, reason: Optional[str] = None) -> dict:
-    """Reject a prompt proposal.
-
-    Args:
-        proposal_id: ID of the proposal to reject.
-        reason: Reason for rejection.
-    """
-    return _call(prompt.cmd_prompt, prompt_command="reject", proposal_id=proposal_id, reason=reason)
-
-
-@_tool()
-def prompt_history() -> list | dict:
-    """Show prompt version history."""
-    return _call(prompt.cmd_prompt, prompt_command="history")
-
-
-@_tool()
-def prompt_diff(
+def prompt_mgmt(
+    action: str,
+    message: Optional[str] = None,
+    description: Optional[str] = None,
+    file: Optional[str] = None,
+    proposal_id: Optional[int] = None,
     proposal: Optional[int] = None,
+    reason: Optional[str] = None,
     v_from: Optional[str] = None,
     v_to: Optional[str] = None,
-) -> dict:
-    """Diff prompt versions or a proposal against active.
+    all: bool = False,
+) -> list | dict:
+    """Prompt version management: show, snapshot, propose, proposals, apply, reject, history, diff.
 
     Args:
-        proposal: Proposal ID to diff against active prompt.
-        v_from: Version to diff from (e.g. "1").
-        v_to: Version to diff to (e.g. "2").
+        action: One of: show, snapshot, propose, proposals, apply, reject, history, diff.
+        message: Snapshot description (for snapshot).
+        description: Brief description of proposed change (for propose).
+        file: Optional source file with proposed content (for propose).
+        proposal_id: Proposal ID (for apply/reject).
+        proposal: Proposal ID to diff against active (for diff).
+        reason: Reason for rejection (for reject).
+        v_from: Version to diff from (for diff).
+        v_to: Version to diff to (for diff).
+        all: Include all statuses in proposals list (default: pending only).
     """
-    return _call(prompt.cmd_prompt, prompt_command="diff", proposal=proposal, v_from=v_from, v_to=v_to)
+    if action == "show":
+        return _call(prompt.cmd_prompt, prompt_command="show")
+    elif action == "snapshot":
+        return _call(prompt.cmd_prompt, prompt_command="snapshot", message=message)
+    elif action == "propose":
+        return _call(prompt.cmd_prompt, prompt_command="propose", description=description, file=file)
+    elif action == "proposals":
+        return _call(prompt.cmd_prompt, prompt_command="proposals", all=all)
+    elif action == "apply":
+        return _call(prompt.cmd_prompt, prompt_command="apply", proposal_id=proposal_id)
+    elif action == "reject":
+        return _call(prompt.cmd_prompt, prompt_command="reject", proposal_id=proposal_id, reason=reason)
+    elif action == "history":
+        return _call(prompt.cmd_prompt, prompt_command="history")
+    elif action == "diff":
+        return _call(prompt.cmd_prompt, prompt_command="diff", proposal=proposal, v_from=v_from, v_to=v_to)
+    else:
+        return {"error": f"Unknown action: {action}. Use: show, snapshot, propose, proposals, apply, reject, history, diff"}
 
 
 # ===========================================================================
-# Bridge tools
-# ===========================================================================
-
-
-@_tool()
-def bridge_generate(project_dir: str, force: bool = False) -> dict:
-    """Generate a bridge AGENTS.md for a project directory.
-
-    Args:
-        project_dir: Path to the project directory.
-        force: Overwrite existing AGENTS.md if present.
-    """
-    return _call(bridge.cmd_bridge, bridge_command="generate", project_dir=project_dir, force=force)
-
-
-@_tool()
-def bridge_sync() -> dict:
-    """Regenerate all registered bridge AGENTS.md files."""
-    return _call(bridge.cmd_bridge, bridge_command="sync")
-
-
-@_tool()
-def bridge_list() -> list | dict:
-    """List all registered bridge projects."""
-    return _call(bridge.cmd_bridge, bridge_command="list")
-
-
-@_tool()
-def bridge_remove(project_dir: str) -> dict:
-    """Remove a bridge project and its AGENTS.md.
-
-    Args:
-        project_dir: Path to the project directory.
-    """
-    return _call(bridge.cmd_bridge, bridge_command="remove", project_dir=project_dir)
-
-
-# ===========================================================================
-# Model management tools
+# Bridge tools (consolidated)
 # ===========================================================================
 
 
 @_tool()
-def model_status() -> dict:
-    """Show current model configuration and policy."""
-    return _call(models.cmd_model, model_command="status")
-
-
-@_tool()
-def model_switch(model_id: str, reason: Optional[str] = None, duration: Optional[str] = None) -> dict:
-    """Switch to a different model.
+def bridge_mgmt(
+    action: str,
+    project_dir: Optional[str] = None,
+    force: bool = False,
+) -> list | dict:
+    """Bridge AGENTS.md management: generate, sync, list, remove.
 
     Args:
-        model_id: Model identifier (e.g. "kimi-for-coding/k2p5").
-        reason: Reason for switch (captured to memory).
-        duration: Temporary switch duration (e.g. "30m", "2h").
+        action: One of: generate, sync, list, remove.
+        project_dir: Path to the project directory (for generate/remove).
+        force: Overwrite existing AGENTS.md (for generate, default: False).
     """
-    return _call(models.cmd_model, model_command="switch", model_id=model_id, reason=reason, duration=duration)
+    if action == "generate":
+        return _call(bridge.cmd_bridge, bridge_command="generate", project_dir=project_dir, force=force)
+    elif action == "sync":
+        return _call(bridge.cmd_bridge, bridge_command="sync")
+    elif action == "list":
+        return _call(bridge.cmd_bridge, bridge_command="list")
+    elif action == "remove":
+        return _call(bridge.cmd_bridge, bridge_command="remove", project_dir=project_dir)
+    else:
+        return {"error": f"Unknown action: {action}. Use: generate, sync, list, remove"}
+
+
+# ===========================================================================
+# Model management tools (consolidated)
+# ===========================================================================
 
 
 @_tool()
-def model_stats(days: int = 7) -> dict:
-    """Show model usage statistics.
-
-    Args:
-        days: Lookback period in days (default: 7).
-    """
-    return _call(models.cmd_model, model_command="stats", days=days)
-
-
-@_tool()
-def model_recommend(
+def model(
+    action: str,
+    model_id: Optional[str] = None,
+    reason: Optional[str] = None,
+    duration: Optional[str] = None,
+    days: int = 7,
     task_description: Optional[str] = None,
     files: int = 0,
     complexity: str = "medium",
+    task_type: Optional[str] = None,
 ) -> dict:
-    """Recommend a model for a given task.
+    """Model management: status, switch, stats, select, recommend, policy.
 
     Args:
-        task_description: Description of the task.
-        files: Number of files involved (default: 0).
-        complexity: Task complexity — low, medium, or high (default: medium).
+        action: One of: status, switch, stats, select, recommend, policy.
+        model_id: Model identifier (for switch, e.g. "kimi-for-coding/k2p5").
+        reason: Reason for switch (for switch).
+        duration: Temporary switch duration (for switch, e.g. "30m", "2h").
+        days: Lookback period for stats (default: 7).
+        task_description: Description of the task (for recommend).
+        files: Number of files involved (for recommend, default: 0).
+        complexity: Task complexity — low, medium, or high (for recommend).
+        task_type: Task category (for select, e.g. "quick_fix", "architecture").
     """
-    return _call(
-        models.cmd_model,
-        model_command="recommend", task_description=task_description,
-        files=files, complexity=complexity,
-    )
+    if action == "status":
+        return _call(models_mod.cmd_model, model_command="status")
+    elif action == "switch":
+        return _call(models_mod.cmd_model, model_command="switch", model_id=model_id, reason=reason, duration=duration)
+    elif action == "stats":
+        return _call(models_mod.cmd_model, model_command="stats", days=days)
+    elif action == "select":
+        return _call(models_mod.cmd_model, model_command="select", task_type=task_type)
+    elif action == "recommend":
+        return _call(models_mod.cmd_model, model_command="recommend", task_description=task_description, files=files, complexity=complexity)
+    elif action == "policy":
+        return _call(models_mod.cmd_model, model_command="policy")
+    else:
+        return {"error": f"Unknown action: {action}. Use: status, switch, stats, select, recommend, policy"}
 
-
-@_tool()
-def model_policy() -> dict:
-    """Show the current model selection policy."""
-    return _call(models.cmd_model, model_command="policy")
-
-
-@_tool()
-def model_select(task_type: str) -> dict:
-    """Select the best model for a task category.
-
-    Args:
-        task_type: Task category (e.g. "quick_fix", "architecture", "debugging").
-    """
-    return _call(models.cmd_model, model_command="select", task_type=task_type)
 
 # ===========================================================================
 # Entry point
